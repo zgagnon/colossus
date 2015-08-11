@@ -1,7 +1,17 @@
 package colossus
 package protocols
 
+import akka.util.ByteString
+import colossus.core.WorkerRef
+import colossus.parsing.DataSize
+import colossus.protocols.memcache.MemcacheCommand._
+import colossus.protocols.memcache.MemcacheReply._
+import colossus.protocols.memcache._
 import service._
+
+import scala.language.higherKinds
+
+import scala.concurrent.{ExecutionContext, Future}
 
 package object memcache {
 
@@ -16,3 +26,149 @@ package object memcache {
   }
 
 }
+
+trait ResponseBridge[M[_]] {
+
+  def flatMap[T, U](t : M[T])(f : T => M[U]) : M[U]
+
+  def success[T](t : T) : M[T]
+
+  def failure[T](ex : Throwable) : M[T]
+}
+
+trait CallbackResponseBridge extends ResponseBridge[Callback] {
+
+  override def flatMap[T, U](t: Callback[T])(f: (T) => Callback[U]): Callback[U] = t.flatMap(f)
+
+  override def success[T](t: T): Callback[T] = Callback.successful(t)
+
+  override def failure[T](ex: Throwable): Callback[T] = Callback.failed(ex)
+}
+
+trait FutureResponseBridge extends ResponseBridge[Future] {
+
+  implicit def executionContext : ExecutionContext
+
+  override def flatMap[T, U](t: Future[T])(f: (T) => Future[U]): Future[U] = t.flatMap(f)
+
+  override def success[T](t: T): Future[T] = Future.successful(t)
+
+  override def failure[T](ex: Throwable): Future[T] = Future.failed(ex)
+}
+
+trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
+
+  protected def executeCommand(c : MemcacheCommand) : M[MemcacheReply]
+
+  private def execute[U](command : MemcacheCommand)(f : MemcacheReply => M[U]) = flatMap(executeCommand(command))(f)
+
+  def add(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
+    execute(Add(MemcachedKey(key), value, ttl, flags)){
+      case Stored => success(true)
+      case NotStored => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when adding $key and $value"))
+    }
+  }
+  def append(key : ByteString, value : ByteString) : M[Boolean] = {
+    execute(Append(MemcachedKey(key), value)){
+      case Stored => success(true)
+      case NotStored => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when appending $key and $value"))
+    }
+  }
+
+  def decr(key : ByteString, value : Long) : M[Option[Long]] = {
+    execute(Decr(MemcachedKey(key), value)){
+      case Counter(v) => success(Some(v))
+      case NotFound => success(None)
+      case x => failure(new Exception(s"unexpected response $x when decr $key with $value"))
+    }
+  }
+  def delete(key : ByteString) : M[Boolean] = {
+    execute(Delete(MemcachedKey(key))) {
+      case Deleted => success(true)
+      case NotFound => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when deleting $key"))
+    }
+  }
+
+  def get(keys : ByteString*) : M[Map[String, Value]] = {
+    execute(Get(keys.map(MemcachedKey(_)) : _*)){
+      case a : Value => success(Map(a.key->a))
+      case Values(x) => success(x.map(y => y.key->y).toMap)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when getting $keys"))
+    }
+  }
+
+  def incr(key : ByteString, value : Long) : M[Option[Long]] = {
+    execute(Incr(MemcachedKey(key), value)){
+      case Counter(v) => success(Some(v))
+      case NotFound => success(None)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when incr $key with $value"))
+    }
+  }
+
+  def prepend(key : ByteString, value : ByteString) : M[Boolean] = {
+    execute(Prepend(MemcachedKey(key), value)){
+      case Stored => success(true)
+      case NotStored => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when prepending $key and $value"))
+    }
+  }
+
+  def replace(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
+    execute(Replace(MemcachedKey(key), value, ttl, flags)){
+      case Stored => success(true)
+      case NotStored => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when replacing $key and $value"))
+    }
+  }
+
+  def set(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
+    execute(Set(MemcachedKey(key), value, ttl, flags)){
+      case Stored => success(true)
+      case NotStored => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when setting $key and $value"))
+    }
+  }
+
+  def touch(key : ByteString, ttl : Int = 0) : M[Boolean] = {
+    execute(Touch(MemcachedKey(key), ttl)){
+      case Touched => success(true)
+      case NotFound => success(false)
+      case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when touching $key with $ttl"))
+    }
+  }
+}
+
+class MemcacheCallbackClient(client : ServiceClient[MemcacheCommand, MemcacheReply]) extends MemcacheClient[Callback] with CallbackResponseBridge {
+
+
+  protected def executeCommand(c: MemcacheCommand): Callback[MemcacheReply] = client.send(c)
+
+}
+
+class MemcacheFutureClient(client : AsyncServiceClient[MemcacheCommand, MemcacheReply])
+                          (implicit val executionContext : ExecutionContext) extends MemcacheClient[Future] with FutureResponseBridge {
+
+
+  protected def executeCommand(c: MemcacheCommand): Future[MemcacheReply] = client.send(c)
+
+
+}
+
+case class UnexpectedMemcacheReplyException(message : String) extends Exception
+
+object MemcacheClient {
+
+  def callbackClient(config: ClientConfig, worker: WorkerRef, maxSize : DataSize = MemcacheReplyParser.DefaultMaxSize) : MemcacheClient[Callback] = {
+    val serviceClient = new ServiceClient[MemcacheCommand, MemcacheReply](new MemcacheClientCodec(maxSize), config, worker)
+    new MemcacheCallbackClient(serviceClient)
+  }
+  def asyncClient(config : ClientConfig, maxSize : DataSize = MemcacheReplyParser.DefaultMaxSize)(implicit io : IOSystem) : MemcacheClient[Future] = {
+    implicit val ec = io.actorSystem.dispatcher
+    val client = AsyncServiceClient(config, new MemcacheClientCodec(maxSize))
+    new MemcacheFutureClient(client)
+  }
+}
+
