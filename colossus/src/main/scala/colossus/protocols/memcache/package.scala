@@ -27,50 +27,58 @@ package object memcache {
 
 }
 
-trait ResponseBridge[M[_]] {
+trait ResponseAdapter[C <: CodecDSL, M[_]] {
 
-  def flatMap[T, U](t : M[T])(f : T => M[U]) : M[U]
+  def executeAndMap[T](i : C#Input)(f : C#Output => M[T]) = flatMap(execute(i))(f)
+
+  def execute(i : C#Input) : M[C#Output]
+
+  def flatMap[T](t : M[C#Output])(f : C#Output => M[T]) : M[T]
 
   def success[T](t : T) : M[T]
 
   def failure[T](ex : Throwable) : M[T]
 }
 
-trait CallbackResponseBridge extends ResponseBridge[Callback] {
+trait CallbackResponseAdapter[C <: CodecDSL] extends ResponseAdapter[C, Callback] {
 
-  override def flatMap[T, U](t: Callback[T])(f: (T) => Callback[U]): Callback[U] = t.flatMap(f)
+  def client : ServiceClient[C#Input, C#Output]
+
+  def execute(i : C#Input) : Callback[C#Output] = client.send(i)
+
+  override def flatMap[T](t: Callback[C#Output])(f: (C#Output) => Callback[T]): Callback[T] = t.flatMap(f)
 
   override def success[T](t: T): Callback[T] = Callback.successful(t)
 
   override def failure[T](ex: Throwable): Callback[T] = Callback.failed(ex)
 }
 
-trait FutureResponseBridge extends ResponseBridge[Future] {
+trait FutureResponseAdapter[C <: CodecDSL] extends ResponseAdapter[C, Future] {
+
+  def client : AsyncServiceClient[C#Input, C#Output]
+
+  def execute(i : C#Input) : Future[C#Output] = client.send(i)
 
   implicit def executionContext : ExecutionContext
 
-  override def flatMap[T, U](t: Future[T])(f: (T) => Future[U]): Future[U] = t.flatMap(f)
+  override def flatMap[T](t: Future[C#Output])(f: (C#Output) => Future[T]): Future[T] = t.flatMap(f)
 
   override def success[T](t: T): Future[T] = Future.successful(t)
 
   override def failure[T](ex: Throwable): Future[T] = Future.failed(ex)
 }
 
-trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
-
-  protected def executeCommand(c : MemcacheCommand) : M[MemcacheReply]
-
-  private def execute[U](command : MemcacheCommand)(f : MemcacheReply => M[U]) = flatMap(executeCommand(command))(f)
+trait MemcacheClient[M[_]] { this : ResponseAdapter[Memcache, M] =>
 
   def add(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
-    execute(Add(MemcachedKey(key), value, ttl, flags)){
+    executeAndMap(Add(MemcachedKey(key), value, ttl, flags)){
       case Stored => success(true)
       case NotStored => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when adding $key and $value"))
     }
   }
   def append(key : ByteString, value : ByteString) : M[Boolean] = {
-    execute(Append(MemcachedKey(key), value)){
+    executeAndMap(Append(MemcachedKey(key), value)){
       case Stored => success(true)
       case NotStored => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when appending $key and $value"))
@@ -78,14 +86,14 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def decr(key : ByteString, value : Long) : M[Option[Long]] = {
-    execute(Decr(MemcachedKey(key), value)){
+    executeAndMap(Decr(MemcachedKey(key), value)){
       case Counter(v) => success(Some(v))
       case NotFound => success(None)
       case x => failure(new Exception(s"unexpected response $x when decr $key with $value"))
     }
   }
   def delete(key : ByteString) : M[Boolean] = {
-    execute(Delete(MemcachedKey(key))) {
+    executeAndMap(Delete(MemcachedKey(key))) {
       case Deleted => success(true)
       case NotFound => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when deleting $key"))
@@ -93,7 +101,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def get(keys : ByteString*) : M[Map[String, Value]] = {
-    execute(Get(keys.map(MemcachedKey(_)) : _*)){
+    executeAndMap(Get(keys.map(MemcachedKey(_)) : _*)){
       case a : Value => success(Map(a.key->a))
       case Values(x) => success(x.map(y => y.key->y).toMap)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when getting $keys"))
@@ -101,7 +109,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def incr(key : ByteString, value : Long) : M[Option[Long]] = {
-    execute(Incr(MemcachedKey(key), value)){
+    executeAndMap(Incr(MemcachedKey(key), value)){
       case Counter(v) => success(Some(v))
       case NotFound => success(None)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when incr $key with $value"))
@@ -109,7 +117,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def prepend(key : ByteString, value : ByteString) : M[Boolean] = {
-    execute(Prepend(MemcachedKey(key), value)){
+    executeAndMap(Prepend(MemcachedKey(key), value)){
       case Stored => success(true)
       case NotStored => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when prepending $key and $value"))
@@ -117,7 +125,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def replace(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
-    execute(Replace(MemcachedKey(key), value, ttl, flags)){
+    executeAndMap(Replace(MemcachedKey(key), value, ttl, flags)){
       case Stored => success(true)
       case NotStored => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when replacing $key and $value"))
@@ -125,7 +133,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def set(key : ByteString, value : ByteString, ttl : Int = 0, flags : Int = 0) : M[Boolean] = {
-    execute(Set(MemcachedKey(key), value, ttl, flags)){
+    executeAndMap(Set(MemcachedKey(key), value, ttl, flags)){
       case Stored => success(true)
       case NotStored => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when setting $key and $value"))
@@ -133,7 +141,7 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 
   def touch(key : ByteString, ttl : Int = 0) : M[Boolean] = {
-    execute(Touch(MemcachedKey(key), ttl)){
+    executeAndMap(Touch(MemcachedKey(key), ttl)){
       case Touched => success(true)
       case NotFound => success(false)
       case x => failure(UnexpectedMemcacheReplyException(s"unexpected response $x when touching $key with $ttl"))
@@ -141,21 +149,14 @@ trait MemcacheClient[M[_]] { this : ResponseBridge[M] =>
   }
 }
 
-class MemcacheCallbackClient(client : ServiceClient[MemcacheCommand, MemcacheReply]) extends MemcacheClient[Callback] with CallbackResponseBridge {
+class MemcacheCallbackClient(val client : ServiceClient[MemcacheCommand, MemcacheReply])
+  extends MemcacheClient[Callback] with CallbackResponseAdapter[Memcache]
 
 
-  protected def executeCommand(c: MemcacheCommand): Callback[MemcacheReply] = client.send(c)
+class MemcacheFutureClient(val client : AsyncServiceClient[MemcacheCommand, MemcacheReply])
+                          (implicit val executionContext : ExecutionContext)
+  extends MemcacheClient[Future] with FutureResponseAdapter[Memcache]
 
-}
-
-class MemcacheFutureClient(client : AsyncServiceClient[MemcacheCommand, MemcacheReply])
-                          (implicit val executionContext : ExecutionContext) extends MemcacheClient[Future] with FutureResponseBridge {
-
-
-  protected def executeCommand(c: MemcacheCommand): Future[MemcacheReply] = client.send(c)
-
-
-}
 
 case class UnexpectedMemcacheReplyException(message : String) extends Exception
 

@@ -10,6 +10,8 @@ import colossus.service.{AsyncServiceClient, ClientConfig}
 import colossus.testkit.ColossusSpec
 import org.scalatest.concurrent.ScalaFutures
 
+import scala.collection.mutable
+import scala.concurrent.Future
 import scala.concurrent.duration._
 /*
 Please be aware when running this test, that if you run it on a machine with a memcached server
@@ -29,7 +31,10 @@ class MemcacheITSpec extends ColossusSpec with ScalaFutures{
   val usedKeys = scala.collection.mutable.HashSet[ByteString]()
 
   override def afterAll() {
-    usedKeys.foreach(key => client.delete(key))
+    implicit val ec = sys.actorSystem.dispatcher
+    println(usedKeys)
+    val f: Future[mutable.HashSet[Boolean]] = Future.sequence(usedKeys.map(client.delete))
+    f.futureValue must be (mutable.HashSet(true, false)) //some keys are deleted by the tests.
     super.afterAll()
   }
   
