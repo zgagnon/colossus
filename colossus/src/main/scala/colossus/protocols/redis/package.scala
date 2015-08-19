@@ -1,13 +1,16 @@
 package colossus
 package protocols
 
-import colossus.parsing.DataSize
-import core.WorkerRef
-import service._
-
 import akka.util.{ByteString, ByteStringBuilder}
-import scala.util.{Success, Failure}
-import Codec._
+import colossus.core.WorkerRef
+import colossus.parsing.DataSize
+import colossus.protocols.redis.Commands._
+import colossus.service.Codec._
+import colossus.service._
+
+import scala.concurrent.{ExecutionContext, Future}
+import scala.concurrent.duration.FiniteDuration
+import scala.language.higherKinds
 
 package object redis {
 
@@ -26,27 +29,87 @@ package object redis {
     def clientCodec() = new RedisClientCodec
     val name = "redis"
   }
+  
+  trait RedisClient[M[_]] {
+    this: ResponseAdapter[Redis, M] =>
 
-  class RedisClient(config: ClientConfig, worker: WorkerRef, maxSize : DataSize = RedisReplyParser.DefaultMaxSize) extends ServiceClient(
-    codec     = new RedisClientCodec(maxSize),
-    config    = config,
-    worker    = worker
-  ) {
-    import UnifiedProtocol._
-    def info: Callback[Map[String, String]] = send(Command(CMD_INFO)).mapTry{_.flatMap{
-      case BulkReply(data) => Success(InfoParser(data.utf8String))
-      case other => Failure(new Error("Invalid response type"))
-    }}
+    def del(key : ByteString) : M[Long] = {
+      executeAndMap(Del(key)){
+        case IntegerReply(x) => success(x)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when deleting $key"))
+      }
+    }
+    def exists(key : ByteString) : M[Boolean] = {
+      executeAndMap(Exists(key)) {
+        case IntegerReply(x) => success(x == 1)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when checking for existence of $key"))
+      }
+    }
+    def get(key : ByteString) : M[ByteString] = {
+      executeAndMap(Get(key)){
+        case BulkReply(x) => success(x)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when getting $key"))
+      }
+    }
+
+    def set(key : ByteString, value : ByteString) : M[Boolean] = {
+      executeAndMap(Set(key, value)){
+        case StatusReply(x) => success(true)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when setting $key and $value"))
+      }
+    }
+    def setnx(key : ByteString, value : ByteString) : M[Boolean] = {
+      executeAndMap(Setnx(key, value)){
+        case IntegerReply(x) => success(x == 1)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when setnx $key and $value"))
+      }
+    }
+    def setex(key : ByteString, value : ByteString, ttl : FiniteDuration) : M[Boolean] = {
+      executeAndMap(Setex(key, value, ttl)){
+        case StatusReply(x) => success(true)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when settex $key and  $value with $ttl"))
+      }
+    }
+    def strlen(key : ByteString) : M[Option[Long]] = {
+      executeAndMap(Strlen(key)){
+        case IntegerReply(x) if x > 0 => success(Some(x))
+        case IntegerReply(x) => success(None)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when strlen $key"))
+      }
+    }
+    def ttl(key : ByteString) : M[Option[Long]] = {
+      executeAndMap(Ttl(key)){
+        case IntegerReply(x) => success(Some(x))
+        case StatusReply(x) => success(None)
+        case x => failure(UnexpectedRedisReplyException(s"unexpected response $x when ttl $key"))
+      }
+    }
   }
 
-  object InfoParser {
-    def apply(infoString: String) = infoString.split("\n")
-      .collect{case s if(s.contains(":")) => s.split(":")}
-      .map{case items => (items(0), items(1).trim)}
-      .toMap    
 
+  class RedisCallbackClient(val client : ServiceClient[Command, Reply])
+    extends RedisClient[Callback] with CallbackResponseAdapter[Redis]
+
+
+  class RedisFutureClient(val client : AsyncServiceClient[Command, Reply])
+                          (implicit val executionContext : ExecutionContext)
+    extends RedisClient[Future] with FutureResponseAdapter[Redis]
+
+  case class UnexpectedRedisReplyException(message : String) extends Exception
+
+
+  object RedisClient {
+
+    def callbackClient(config: ClientConfig, worker: WorkerRef, maxSize : DataSize = RedisReplyParser.DefaultMaxSize) : RedisClient[Callback] = {
+      val serviceClient = new ServiceClient[Command, Reply](new RedisClientCodec(maxSize), config, worker)
+      new RedisCallbackClient(serviceClient)
+    }
+    def asyncClient(config : ClientConfig, maxSize : DataSize = RedisReplyParser.DefaultMaxSize)(implicit io : IOSystem) : RedisClient[Future] = {
+      implicit val ec = io.actorSystem.dispatcher
+      val client = AsyncServiceClient(config, new RedisClientCodec(maxSize))
+      new RedisFutureClient(client)
+    }
   }
-
 
   implicit object RedisServerCodecFactory extends ServerCodecFactory[Command, Reply] {
     def apply() = new RedisServerCodec
@@ -54,7 +117,6 @@ package object redis {
   implicit object RedisClientCodecFactory extends ClientCodecFactory[Command, Reply] {
     def apply() = new RedisClientCodec
   }
-
 
   object UnifiedBuilder {
 
@@ -67,7 +129,6 @@ package object redis {
       builder append data
       builder append RN
     }
-
   }
 }
 

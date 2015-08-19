@@ -32,7 +32,6 @@ class MemcacheITSpec extends ColossusSpec with ScalaFutures{
 
   override def afterAll() {
     implicit val ec = sys.actorSystem.dispatcher
-    println(usedKeys)
     val f: Future[mutable.HashSet[Boolean]] = Future.sequence(usedKeys.map(client.delete))
     f.futureValue must be (mutable.HashSet(true, false)) //some keys are deleted by the tests.
     super.afterAll()
